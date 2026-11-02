@@ -21,10 +21,11 @@ defmodule Player.Heuristic do
   plain BFS (`weights(:bfs)`), which is what the baseline measured.
   """
 
-  # Chosen on 60 cases: the lead bonus did not help (fase3_hallazgos.md), and
-  # depth 1.5 makes the first path optimal more often than 1.0 at the same
-  # median time, while 2.0 is slower (fase4_hallazgos.md).
-  @default %{out: 2.0, title: 1.5, rel: 2.0, lead: 0.0, depth: 1.5}
+  # The lead bonus did not help (fase3_hallazgos.md). depth 1.5 looked better
+  # on 60 cases (fase4), but on all 240 cases with arrival-time timestamps
+  # depth 1.0 halves the very_hard p90 and wins the simulated matches, at a
+  # small cost in path length (fase6_hallazgos.md).
+  @default %{out: 2.0, title: 1.5, rel: 2.0, lead: 0.0, depth: 1.0}
   @lead_links 40
   @rel_scale 5.0
 

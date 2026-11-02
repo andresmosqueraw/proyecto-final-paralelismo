@@ -190,7 +190,9 @@ defmodule Bench do
         opp
       end
 
-    {:ok, pid} = Player.Crawler.start(start, target, crawler_opts)
+    {start_us, {:ok, pid}} =
+      :timer.tc(fn -> Player.Crawler.start(start, target, crawler_opts) end)
+
     ref = Process.monitor(pid)
 
     acc =
@@ -225,12 +227,17 @@ defmodule Bench do
     end
 
     write_trace(trace_file, c, pid)
+    # The race must still be alive here: the harness is the one that kills it.
+    crashed = not Process.alive?(pid)
     if opponent, do: Process.exit(opponent, :kill)
     Process.exit(pid, :kill)
 
     receive do
       {:DOWN, ^ref, _, _, _} -> :ok
     end
+
+    Process.sleep(50)
+    procs_after = length(Process.list())
 
     reports = Enum.reverse(acc.reports)
     invalid = Enum.count(reports, fn {_t, p} -> verify(p, start, target) != :ok end)
@@ -276,7 +283,10 @@ defmodule Bench do
       "fetch_p99" => pct.(fetch_ms, 99),
       "proc_p50" => pct.(proc_ms, 50),
       "proc_p99" => pct.(proc_ms, 99),
-      "race_queue_max" => acc.qmax
+      "race_queue_max" => acc.qmax,
+      "start_us" => start_us,
+      "crashed" => crashed,
+      "procs_after" => procs_after
     }
   end
 

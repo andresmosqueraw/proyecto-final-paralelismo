@@ -4,7 +4,8 @@
 defmodule BenchStats do
   @columns ~w(level start target dist_2007 found t_first_ms t_best_ms articles reports
               invalid complete opt_ref hops_ratio fetched errors status_max_us utilization
-              report_log fetch_p50 fetch_p95 fetch_p99 proc_p50 proc_p99 race_queue_max)
+              report_log fetch_p50 fetch_p95 fetch_p99 proc_p50 proc_p99 race_queue_max
+              start_us crashed procs_after)
   @levels ~w(easy medium hard very_hard)
 
   def columns, do: @columns
@@ -107,6 +108,18 @@ defmodule BenchStats do
           "#{fmt(s.fetch_p50)} | #{fmt(s.fetch_p99)} |\n"
       end
 
-    "## #{title}\n\n" <> head <> Enum.join(lines)
+    crashes = Enum.count(rows, &(&1["crashed"] == true))
+    starts = vals(rows, "start_us")
+    procs = vals(rows, "procs_after")
+
+    extra =
+      if starts == [],
+        do: "",
+        else:
+          "\nCrashes: #{crashes}. start/2: máx #{Enum.max(starts)} µs, mediana #{median(starts)} µs. " <>
+            "Procesos vivos tras cada carrera: #{Enum.min(procs)}–#{Enum.max(procs)} " <>
+            "(primera #{hd(procs)}, última #{List.last(procs)}).\n"
+
+    "## #{title}\n\n" <> head <> Enum.join(lines) <> extra
   end
 end

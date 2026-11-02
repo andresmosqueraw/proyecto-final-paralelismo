@@ -201,7 +201,7 @@ defmodule Player.Race do
       case result do
         :ok -> state
         # The page answered (404, 500...): asking again will not help.
-        {:error, {:http, _status}} -> state
+        {:error, {:http, _status}} -> give_up(state, job)
         # Transport errors and timeouts: one retry.
         _error -> retry(state, job)
       end
@@ -315,13 +315,16 @@ defmodule Player.Race do
     spawn_target_fetch(state, attempt + 1)
   end
 
-  defp retry(state, {:target, _attempt}) do
-    # Go on without the target's links rather than wait forever.
+  defp retry(state, job), do: give_up(state, job)
+
+  # Without the target's links, go on with the rest of the heuristic rather
+  # than make the start page wait for them.
+  defp give_up(state, {:target, _attempt}) do
     :atomics.put(state.ctx.atomics, @a_target_ready, 1)
     state
   end
 
-  defp retry(state, _job), do: state
+  defp give_up(state, _job), do: state
 
   ## Work done inside tasks
 
