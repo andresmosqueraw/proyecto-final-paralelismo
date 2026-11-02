@@ -106,7 +106,8 @@ defmodule Player.RaceTest do
       target = kiwix() <> t
       {:ok, pid} = Player.Crawler.start(start, target)
 
-      assert_receive {:path_found, _, path}, 60_000
+      # Other races (e.g. contract_test against :8080) may report too.
+      assert_receive {:path_found, _, [^start | _] = path}, 60_000
       assert List.first(path) == start
       assert List.last(path) == target
       assert Player.Path.valid_shape?(path, start, target)

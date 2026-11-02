@@ -61,8 +61,8 @@ defmodule Player.Race do
       ])
 
     status = :ets.new(:status, [:set, :public, read_concurrency: true])
-    # 1: pages fetched
-    counters = :counters.new(1, [:write_concurrency])
+    # 1: pages fetched, 2: failed fetches
+    counters = :counters.new(2, [:write_concurrency])
     # 1: length (in URLs) of the best path reported so far
     best = :atomics.new(1, [])
     :atomics.put(best, 1, @no_path)
@@ -125,7 +125,7 @@ defmodule Player.Race do
     state =
       case result do
         :ok -> state
-        {:error, _reason} -> retry(state, job)
+        _error -> retry(state, job)
       end
 
     {:noreply, dispatch(state)}
@@ -209,8 +209,13 @@ defmodule Player.Race do
         :ok
 
       {:error, reason} ->
+        :counters.add(ctx.counters, 2, 1)
         {:error, reason}
     end
+  rescue
+    # The race was killed: its ETS tables are gone and this task is about to
+    # be shut down by the supervisor. Exit quietly instead of logging a crash.
+    ArgumentError -> :race_gone
   end
 
   ## Results
