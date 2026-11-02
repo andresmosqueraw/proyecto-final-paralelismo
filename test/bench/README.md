@@ -32,6 +32,7 @@ docker run --rm --network host -v "$PWD":/app -v player_deps:/app/deps -v player
 | `--out F.tsv` | Una fila por caso. El resumen por nivel se escribe en `F.md`. |
 | `--concurrency N` | Se pasa a `Player.Crawler.start/3`. |
 | `--weights W` | Pesos de `Player.Heuristic`: `default`, `bfs` (reproduce la línea base) o `out=2,title=1.5,rel=2,lead=0,depth=1`. |
+| `--report-policy P` | `score` (por defecto) o `always`: cuándo reportar un camino más corto (`Player.Race.worth_reporting?/4`). |
 | `--trace F.tsv` | Escribe, por cada página descargada, la profundidad, el score y si enlaza al destino. Sirve de entrada a `validate.exs`. |
 
 ## Columnas del TSV
@@ -48,6 +49,7 @@ Es TSV porque algunos títulos tienen comas.
 | `hops_ratio` | `(opt_ref − 1) / (articles − 1)`, igual que el componente Hops del puntaje. |
 | `fetched`, `errors` | Páginas descargadas y fetches fallidos. |
 | `status_max_us`, `utilization` | Peor latencia de `status/1` y utilización de schedulers durante la carrera. |
+| `report_log` | Todos los reportes como `t_ms:artículos;…`. Lo usa `match.exs`. |
 
 ## Comparar contra la línea base
 
@@ -69,3 +71,18 @@ mix run --no-start test/bench/validate.exs /out/TRACE.tsv
 ```
 
 Calcula por caso el ρ de Spearman entre el score y −d\*, donde d\* = 1 si la página enlaza al destino y d\* ≥ 2 si no. Lo da también normalizado por el máximo posible, √(3p(1−p)), y calcula además el AUC.
+
+## Simular enfrentamientos
+
+```sh
+mix run --no-start test/bench/match.exs A.tsv B.tsv [--verify-ms 300]
+```
+
+Simula, caso por caso, una carrera de A contra B con las reglas de la plataforma:
+
+- cada jugador queda *settled* cuando se verifica su primer camino;
+- la carrera termina cuando los dos están *settled*, y lo que se reporte después no cuenta;
+- se conserva el camino más corto, con la hora de llegada de su reporte;
+- puntaje = 0,40 found + 0,15 first + 0,20 hops + 0,15 time + 0,10 utilización.
+
+La salida da el puntaje medio y las victorias por nivel.

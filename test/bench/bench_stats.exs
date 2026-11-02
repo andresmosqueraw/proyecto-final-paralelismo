@@ -3,7 +3,8 @@
 
 defmodule BenchStats do
   @columns ~w(level start target dist_2007 found t_first_ms t_best_ms articles reports
-              invalid complete opt_ref hops_ratio fetched errors status_max_us utilization)
+              invalid complete opt_ref hops_ratio fetched errors status_max_us utilization
+              report_log)
   @levels ~w(easy medium hard very_hard)
 
   def columns, do: @columns
@@ -20,6 +21,7 @@ defmodule BenchStats do
     end
   end
 
+  # report_log ("t_ms:articles;t_ms:articles") is not a number, so it stays a string.
   defp parse("true"), do: true
   defp parse("false"), do: false
   defp parse(""), do: nil

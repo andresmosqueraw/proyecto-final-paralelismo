@@ -11,6 +11,7 @@
 #   --out FILE.tsv     per-case results (default bench_results.tsv); FILE.md gets the summary
 #   --concurrency N    passed to Player.Crawler.start/3
 #   --weights W        heuristic weights: "bfs", "default" or "out=2,title=1.5,rel=2,lead=0.3,depth=1"
+#   --report-policy P  "score" (default) or "always": when to report a shorter path
 #   --trace FILE.tsv   also write, per fetched page: case, depth, score, links_target
 #   --label TEXT       title of the summary
 #
@@ -38,6 +39,7 @@ defmodule Bench do
           out: :string,
           concurrency: :integer,
           weights: :string,
+          report_policy: :string,
           trace: :string,
           label: :string
         ]
@@ -50,7 +52,11 @@ defmodule Bench do
 
     crawler_opts =
       Keyword.take(opts, [:concurrency]) ++
-        [weights: parse_weights(Keyword.get(opts, :weights, "default")), trace: trace_file != nil]
+        [
+          weights: parse_weights(Keyword.get(opts, :weights, "default")),
+          report_policy: String.to_atom(Keyword.get(opts, :report_policy, "score")),
+          trace: trace_file != nil
+        ]
 
     if trace_file,
       do: File.write!(trace_file, "level\tstart\ttarget\tdepth\tscore\tlinks_target\n")
@@ -169,6 +175,13 @@ defmodule Bench do
         nil -> 0
       end
 
+    # Shortest path the race knows, reported or not (report_policy may skip some).
+    best_known =
+      case :sys.get_state(pid) do
+        %{ctx: %{atomics: a}} -> :atomics.get(a, 1)
+        _ -> nil
+      end
+
     write_trace(trace_file, c, pid)
     Process.exit(pid, :kill)
 
@@ -182,14 +195,16 @@ defmodule Bench do
     articles = if best, do: length(elem(best, 1))
     ref_2007 = if c.dist, do: c.dist + 1
 
-    # Reference for the optimum, in articles. If the pruned BFS ran to the end,
-    # our path is the shortest one (up to dedupe races). Otherwise use the
-    # 2007 distance, never above what we found.
+    # Reference for the optimum, in articles. If the pruned search ran to the
+    # end, the shortest path it knows (reported or not) is the optimum (up to
+    # depth overestimates). Otherwise use the 2007 distance, never above that.
+    known = if articles && best_known, do: min(articles, best_known), else: articles
+
     opt_ref =
       cond do
-        articles && acc.complete -> articles
-        articles && ref_2007 -> min(articles, ref_2007)
-        articles -> articles
+        known && acc.complete -> known
+        known && ref_2007 -> min(known, ref_2007)
+        known -> known
         true -> ref_2007
       end
 
@@ -211,7 +226,8 @@ defmodule Bench do
       "fetched" => (acc.last && acc.last.visited_count) || 0,
       "errors" => errors,
       "status_max_us" => acc.status_max,
-      "utilization" => utilization(sw0, sw1)
+      "utilization" => utilization(sw0, sw1),
+      "report_log" => Enum.map_join(reports, ";", fn {t, p} -> "#{t}:#{length(p)}" end)
     }
   end
 

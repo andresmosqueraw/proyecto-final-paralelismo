@@ -21,9 +21,10 @@ defmodule Player.Heuristic do
   plain BFS (`weights(:bfs)`), which is what the baseline measured.
   """
 
-  # Chosen by ablation on 60 cases (fase3_hallazgos.md): the lead bonus did not
-  # help, so it is off by default.
-  @default %{out: 2.0, title: 1.5, rel: 2.0, lead: 0.0, depth: 1.0}
+  # Chosen on 60 cases: the lead bonus did not help (fase3_hallazgos.md), and
+  # depth 1.5 makes the first path optimal more often than 1.0 at the same
+  # median time, while 2.0 is slower (fase4_hallazgos.md).
+  @default %{out: 2.0, title: 1.5, rel: 2.0, lead: 0.0, depth: 1.5}
   @lead_links 40
   @rel_scale 5.0
 

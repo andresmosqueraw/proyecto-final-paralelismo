@@ -36,7 +36,12 @@ defmodule Player.Race do
   After a path of `L` URLs is found, pages at depth `d` are only useful if
   `d + 2 < L`: deeper frontier entries are deleted and no deeper links are
   queued, and the search keeps looking for a shorter path until the frontier
-  empties.
+  empties. When it empties, the best path is the shortest one (bar depth
+  overestimates) and the race stops fetching. It does not call
+  `report_exhausted/0` then: the platform ignores it once a path is in.
+
+  A shorter path is only reported if it is worth it (`worth_reporting?/4`,
+  option `report_policy: :score`, the default; `:always` reports every one).
   """
 
   use GenServer, restart: :temporary
@@ -130,7 +135,11 @@ defmodule Player.Race do
       target_url: target_url,
       concurrency: Keyword.get(opts, :concurrency, 4 * System.schedulers_online()),
       inflight: %{},
+      # The path we reported last and when (ms since start); the harness keeps
+      # it with that arrival time.
       best_path: nil,
+      reported_at: nil,
+      report_policy: Keyword.get(opts, :report_policy, :score),
       finished: false,
       started_at: System.monotonic_time(:millisecond)
     }
@@ -326,12 +335,17 @@ defmodule Player.Race do
 
         {u, c, s}, acc ->
           key = {-s, :erlang.unique_integer([:monotonic, :positive])}
-          row = {c, parent, u, child_depth, key, :queued}
 
-          if :ets.insert_new(visited, row) do
+          if :ets.insert_new(visited, {c, parent, u, child_depth, key, :queued}) do
             [{key, u, c, child_depth} | acc]
           else
-            maybe_promote(visited, frontier, c, s, row, key, u, child_depth, acc)
+            maybe_promote(
+              visited,
+              frontier,
+              {c, parent, u, child_depth, s},
+              ctx.weights.depth,
+              acc
+            )
           end
       end)
 
@@ -339,14 +353,26 @@ defmodule Player.Race do
   end
 
   # A link already queued from another page: move it up if it now scores
-  # higher. The compare-and-swap fails if the row changed in the meantime
-  # (taken by the race, or promoted by another task), and then we do nothing.
-  defp maybe_promote(visited, frontier, c, s, row, key, u, child_depth, acc) do
+  # higher. If the new page is at least as shallow as the old parent, it
+  # becomes the parent. If it is deeper, the parent is kept (re-parenting would
+  # make the path longer) and only the priority goes up, scored at the old
+  # depth. The compare-and-swap fails if the row changed in the meantime (taken
+  # by the race, or promoted by another task), and then we do nothing.
+  defp maybe_promote(visited, frontier, {c, parent, u, child_depth, s}, w_depth, acc) do
     case :ets.lookup(visited, c) do
-      [{^c, _p, _u, _d, {old_neg, _} = old_key, :queued} = old] when s > -old_neg ->
-        if :ets.select_replace(visited, [{old, [], [{:const, row}]}]) == 1 do
+      [{^c, old_p, old_u, old_d, {old_neg, _} = old_key, :queued} = old] ->
+        {p2, u2, d2, s2} =
+          if child_depth <= old_d,
+            do: {parent, u, child_depth, s},
+            else: {old_p, old_u, old_d, s + w_depth * (child_depth - old_d)}
+
+        key = {-s2, :erlang.unique_integer([:monotonic, :positive])}
+
+        if s2 > -old_neg and
+             :ets.select_replace(visited, [{old, [], [{:const, {c, p2, u2, d2, key, :queued}}]}]) ==
+               1 do
           :ets.delete(frontier, old_key)
-          [{key, u, c, child_depth} | acc]
+          [{key, u2, c, d2} | acc]
         else
           acc
         end
@@ -371,26 +397,61 @@ defmodule Player.Race do
 
     if path != [] and length(path) < best and
          Path.valid_shape?(path, state.start_url, state.target_url) do
-      WikiRace.Harness.report(path)
       len = length(path)
+      now = System.monotonic_time(:millisecond) - state.started_at
+      # Search only for paths shorter than the best one known, reported or not.
       :atomics.put(state.ctx.atomics, @a_best, len)
-      :ets.update_element(state.status, :status, [{3, path}, {4, :found}])
       # Entries at depth >= len - 2 cannot lead to a shorter path.
       :ets.select_delete(state.ctx.frontier, [
         {{:_, :_, :_, :"$1"}, [{:>=, :"$1", len - 2}], [true]}
       ])
 
-      Logger.info(
-        "[race] path of #{len} articles after " <>
-          "#{System.monotonic_time(:millisecond) - state.started_at} ms: " <>
-          Enum.map_join(path, " -> ", &URL.title/1)
-      )
+      if report?(state, len, now) do
+        WikiRace.Harness.report(path)
+        # status/1 counts as a report too, so it only ever shows reported paths.
+        :ets.update_element(state.status, :status, [{3, path}, {4, :found}])
 
-      %{state | best_path: path}
+        Logger.info(
+          "[race] path of #{len} articles after #{now} ms: " <>
+            Enum.map_join(path, " -> ", &URL.title/1)
+        )
+
+        %{state | best_path: path, reported_at: now}
+      else
+        Logger.info(
+          "[race] not reporting a path of #{len} articles at #{now} ms " <>
+            "(reported #{length(state.best_path)} at #{state.reported_at} ms)"
+        )
+
+        state
+      end
     else
       state
     end
   end
+
+  @doc """
+  Whether reporting a shorter path is worth it (the harness keeps the shortest
+  path *with its arrival time*, and the race ends as soon as both crawlers
+  have a verified path, so improvements only count if they come early).
+
+  Going from `l` to `l2` articles, reported at `t1` and now `t2` ms, assuming
+  we are the fastest crawler and the new path is the shortest in the race:
+
+      gain (Hops) = 0.20 * (1 - l2 / l)
+      loss (Time) = 0.15 * (1 - t1 / t2)
+
+  Report only if the gain is larger.
+  """
+  def worth_reporting?(l, t1, l2, t2) do
+    0.20 * (1 - l2 / l) > 0.15 * (1 - max(t1, 1) / max(t2, 1))
+  end
+
+  defp report?(%{best_path: nil}, _len, _now), do: true
+  defp report?(%{report_policy: :always}, _len, _now), do: true
+
+  defp report?(state, len, now),
+    do: worth_reporting?(length(state.best_path), state.reported_at, len, now)
 
   defp maybe_finish(%{inflight: inflight} = state) when map_size(inflight) > 0, do: state
   defp maybe_finish(state), do: finish(state)
