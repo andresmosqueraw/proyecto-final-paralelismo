@@ -11,6 +11,10 @@
 #   --out FILE.tsv     per-case results (default bench_results.tsv); FILE.md gets the summary
 #   --concurrency N    passed to Player.Crawler.start/3
 #   --weights W        heuristic weights: "bfs", "default" or "out=2,title=1.5,rel=2,lead=0.3,depth=1"
+#   --bfs-share F      portfolio: share of dispatches taken shallowest-first (default 0)
+#   --opponent-concurrency N  also run a second crawler (same code, N fetches in
+#                      flight) on the same case at the same time, sharing Kiwix
+#                      like a real race; only our crawler is measured
 #   --report-policy P  "score" (default) or "always": when to report a shorter path
 #   --trace FILE.tsv   also write, per fetched page: case, depth, score, links_target
 #   --label TEXT       title of the summary
@@ -40,6 +44,8 @@ defmodule Bench do
           concurrency: :integer,
           weights: :string,
           report_policy: :string,
+          bfs_share: :float,
+          opponent_concurrency: :integer,
           trace: :string,
           label: :string
         ]
@@ -51,11 +57,12 @@ defmodule Bench do
     trace_file = Keyword.get(opts, :trace)
 
     crawler_opts =
-      Keyword.take(opts, [:concurrency]) ++
+      Keyword.take(opts, [:concurrency, :bfs_share]) ++
         [
           weights: parse_weights(Keyword.get(opts, :weights, "default")),
           report_policy: String.to_atom(Keyword.get(opts, :report_policy, "score")),
-          trace: trace_file != nil
+          trace: trace_file != nil,
+          measure: true
         ]
 
     if trace_file,
@@ -78,7 +85,16 @@ defmodule Bench do
 
     rows =
       for {c, i} <- Enum.with_index(cases, 1) do
-        row = run_case(c, kiwix, time_s * 1_000, crawler_opts, trace_file)
+        row =
+          run_case(
+            c,
+            kiwix,
+            time_s * 1_000,
+            crawler_opts,
+            trace_file,
+            opts[:opponent_concurrency]
+          )
+
         File.write!(out, BenchStats.to_line(row) <> "\n", [:append])
 
         IO.puts(
@@ -158,15 +174,28 @@ defmodule Bench do
     end
   end
 
-  defp run_case(c, kiwix, limit_ms, crawler_opts, trace_file) do
+  defp run_case(c, kiwix, limit_ms, crawler_opts, trace_file, opponent_n) do
     start = slug(kiwix, c.start)
     target = slug(kiwix, c.target)
     flush()
     sw0 = :erlang.statistics(:scheduler_wall_time_all)
     t0 = System.monotonic_time(:millisecond)
+
+    opponent =
+      if opponent_n do
+        opp_opts =
+          Keyword.merge(crawler_opts, concurrency: opponent_n, measure: false, trace: false)
+
+        {:ok, opp} = Player.Crawler.start(start, target, opp_opts)
+        opp
+      end
+
     {:ok, pid} = Player.Crawler.start(start, target, crawler_opts)
     ref = Process.monitor(pid)
-    acc = loop(pid, t0, limit_ms, %{reports: [], status_max: 0, last: nil, complete: false})
+
+    acc =
+      loop(pid, t0, limit_ms, %{reports: [], status_max: 0, last: nil, complete: false, qmax: 0})
+
     sw1 = :erlang.statistics(:scheduler_wall_time_all)
 
     errors =
@@ -182,7 +211,21 @@ defmodule Bench do
         _ -> nil
       end
 
+    measured =
+      case Player.Registry.lookup(pid) do
+        %{measure: m} when m != nil -> :ets.tab2list(m)
+        _ -> []
+      end
+
+    fetch_ms = measured |> Enum.map(&elem(&1, 0)) |> Enum.sort()
+    proc_ms = measured |> Enum.map(&elem(&1, 1)) |> Enum.sort()
+
+    pct = fn xs, p ->
+      if xs == [], do: "", else: Float.round(BenchStats.percentile(xs, p) * 1.0, 1)
+    end
+
     write_trace(trace_file, c, pid)
+    if opponent, do: Process.exit(opponent, :kill)
     Process.exit(pid, :kill)
 
     receive do
@@ -227,7 +270,13 @@ defmodule Bench do
       "errors" => errors,
       "status_max_us" => acc.status_max,
       "utilization" => utilization(sw0, sw1),
-      "report_log" => Enum.map_join(reports, ";", fn {t, p} -> "#{t}:#{length(p)}" end)
+      "report_log" => Enum.map_join(reports, ";", fn {t, p} -> "#{t}:#{length(p)}" end),
+      "fetch_p50" => pct.(fetch_ms, 50),
+      "fetch_p95" => pct.(fetch_ms, 95),
+      "fetch_p99" => pct.(fetch_ms, 99),
+      "proc_p50" => pct.(proc_ms, 50),
+      "proc_p99" => pct.(proc_ms, 99),
+      "race_queue_max" => acc.qmax
     }
   end
 
@@ -247,15 +296,28 @@ defmodule Bench do
 
       true ->
         receive do
-          {:path_found, _from, path} ->
-            loop(pid, t0, limit_ms, %{acc | reports: [{now, path} | acc.reports]})
+          {:path_found, ^pid, path} ->
+            # Arrival time, not the start of this wait (up to 250 ms earlier).
+            t = System.monotonic_time(:millisecond) - t0
+            loop(pid, t0, limit_ms, %{acc | reports: [{t, path} | acc.reports]})
 
+          # Our :exhausted, or anything from the opponent crawler.
           {:exhausted, _from} ->
+            loop(pid, t0, limit_ms, acc)
+
+          {:path_found, _other, _path} ->
             loop(pid, t0, limit_ms, acc)
         after
           250 ->
             {us, st} = :timer.tc(fn -> Player.Crawler.status(pid) end)
-            loop(pid, t0, limit_ms, %{acc | last: st, status_max: max(acc.status_max, us)})
+            q = with {:message_queue_len, n} <- Process.info(pid, :message_queue_len), do: n
+
+            loop(pid, t0, limit_ms, %{
+              acc
+              | last: st,
+                status_max: max(acc.status_max, us),
+                qmax: max(acc.qmax, q || 0)
+            })
         end
     end
   end

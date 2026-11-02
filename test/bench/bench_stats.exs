@@ -4,7 +4,7 @@
 defmodule BenchStats do
   @columns ~w(level start target dist_2007 found t_first_ms t_best_ms articles reports
               invalid complete opt_ref hops_ratio fetched errors status_max_us utilization
-              report_log)
+              report_log fetch_p50 fetch_p95 fetch_p99 proc_p50 proc_p99 race_queue_max)
   @levels ~w(easy medium hard very_hard)
 
   def columns, do: @columns
@@ -72,7 +72,9 @@ defmodule BenchStats do
       util: rows |> vals("utilization") |> mean(),
       fetched_med: rows |> vals("fetched") |> median(),
       errors: rows |> vals("errors") |> Enum.sum(),
-      status_max: rows |> vals("status_max_us") |> Enum.max(fn -> 0 end)
+      status_max: rows |> vals("status_max_us") |> Enum.max(fn -> 0 end),
+      fetch_p50: rows |> vals("fetch_p50") |> median(),
+      fetch_p99: rows |> vals("fetch_p99") |> median()
     }
   end
 
@@ -93,15 +95,16 @@ defmodule BenchStats do
     head =
       "| nivel | n | found | % found | inválidos | t_primer mediana (ms) | t_primer p90 (ms) | " <>
         "t_mejor mediana (ms) | hops óptimo/nuestro | % BFS completo | utilización | " <>
-        "fetches mediana | errores fetch | status/1 máx (µs) |\n" <>
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+        "fetches mediana | errores fetch | status/1 máx (µs) | fetch p50 (ms) | fetch p99 (ms) |\n" <>
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
 
     lines =
       for {label, s} <- by_level(rows) ++ [{"**total**", stats(rows)}] do
         "| #{label} | #{s.n} | #{s.found} | #{fmt(s.found_pct)} | #{s.invalid} | " <>
           "#{fmt(s.t_first_med)} | #{fmt(s.t_first_p90)} | #{fmt(s.t_best_med)} | " <>
           "#{fmt(s.hops_ratio)} | #{fmt(s.complete_pct)} | #{fmt(s.util)} | " <>
-          "#{fmt(s.fetched_med)} | #{s.errors} | #{s.status_max} |\n"
+          "#{fmt(s.fetched_med)} | #{s.errors} | #{s.status_max} | " <>
+          "#{fmt(s.fetch_p50)} | #{fmt(s.fetch_p99)} |\n"
       end
 
     "## #{title}\n\n" <> head <> Enum.join(lines)

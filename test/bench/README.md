@@ -32,6 +32,8 @@ docker run --rm --network host -v "$PWD":/app -v player_deps:/app/deps -v player
 | `--out F.tsv` | Una fila por caso. El resumen por nivel se escribe en `F.md`. |
 | `--concurrency N` | Se pasa a `Player.Crawler.start/3`. |
 | `--weights W` | Pesos de `Player.Heuristic`: `default`, `bfs` (reproduce la línea base) o `out=2,title=1.5,rel=2,lead=0,depth=1`. |
+| `--bfs-share F` | Portafolio: fracción del dispatch que toma el nodo menos profundo en vez del mejor score. Por defecto 0. |
+| `--opponent-concurrency N` | Corre al mismo tiempo un segundo crawler (el mismo código, con N fetches en vuelo) sobre el mismo caso, compartiendo Kiwix como en una carrera real. Solo se mide el nuestro. |
 | `--report-policy P` | `score` (por defecto) o `always`: cuándo reportar un camino más corto (`Player.Race.worth_reporting?/4`). |
 | `--trace F.tsv` | Escribe, por cada página descargada, la profundidad, el score y si enlaza al destino. Sirve de entrada a `validate.exs`. |
 
@@ -50,6 +52,8 @@ Es TSV porque algunos títulos tienen comas.
 | `fetched`, `errors` | Páginas descargadas y fetches fallidos. |
 | `status_max_us`, `utilization` | Peor latencia de `status/1` y utilización de schedulers durante la carrera. |
 | `report_log` | Todos los reportes como `t_ms:artículos;…`. Lo usa `match.exs`. |
+| `fetch_p50/p95/p99`, `proc_p50/p99` | Latencia de cada fetch y tiempo de proceso de cada página (extraer, puntuar e insertar), en ms. |
+| `race_queue_max` | Cola máxima de mensajes del coordinador, para detectar contención. |
 
 ## Comparar contra la línea base
 

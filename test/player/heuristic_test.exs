@@ -6,11 +6,11 @@ defmodule Player.HeuristicTest do
   @base "http://localhost:8080/content/wikipedia_en_all_nopic/"
 
   test "tokens decode the title, drop stopwords and short tokens" do
-    assert Heuristic.tokens(@base <> "History_of_the_United_States") == ~w(history united states)
-    assert Heuristic.tokens(@base <> "Alien%3A_Resurrection") == ~w(alien resurrection)
-
-    assert Heuristic.tokens(@base <> "Human%E2%80%93wildlife_conflict") ==
-             ~w(human wildlife conflict)
+    tokens = &Heuristic.tokens(Player.URL.canonical(@base <> &1))
+    assert tokens.("History_of_the_United_States") == ~w(history united states)
+    assert tokens.("Alien%3A_Resurrection") == ~w(alien resurrection)
+    assert tokens.("Human%E2%80%93wildlife_conflict") == ~w(human wildlife conflict)
+    assert tokens.("Pok%C3%A9mon_(TV_series)") == ~w(pokémon tv series)
   end
 
   test "title overlap and rel stay in [0, 1]" do

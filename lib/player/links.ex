@@ -19,13 +19,14 @@ defmodule Player.Links do
   @spec extract(binary(), String.t()) :: [{String.t(), String.t()}]
   def extract(body, base) do
     self_canon = URL.canonical(base)
+    resolve = URL.resolver(base)
 
     @href
     |> Regex.scan(body, capture: :all_but_first)
     |> Enum.reduce({[], MapSet.new([self_canon])}, fn groups, {acc, seen} ->
       href = groups |> Enum.find("", &(&1 != "")) |> decode_entities()
 
-      case URL.resolve(base, href) do
+      case resolve.(href) do
         {_url, canon} = link ->
           if MapSet.member?(seen, canon),
             do: {acc, seen},

@@ -50,6 +50,26 @@ defmodule Player.LinksTest do
     end
   end
 
+  for page <- ["Tiger", "United_States"] do
+    test "the fast resolver gives exactly what URI.merge + canonical give, on every href of #{page}" do
+      page = unquote(page)
+      body = fixture(page)
+      base = @base <> page
+      fast = URL.resolver(base)
+
+      hrefs =
+        ~r/<a\s[^>]*?href=(?:"([^"]*)"|'([^']*)')/is
+        |> Regex.scan(body, capture: :all_but_first)
+        |> Enum.map(fn gs -> gs |> Enum.find("", &(&1 != "")) |> Links.decode_entities() end)
+
+      assert length(hrefs) > 1000
+      for href <- hrefs, do: assert(fast.(href) == URL.resolve(base, href), href)
+      # Edge cases not in these pages.
+      for href <- ["A%2FB", "Foo%", "AC/DC", "x#", "%C3%A9t%C3%A9", "Trailing%2F"],
+          do: assert(fast.(href) == URL.resolve(base, href), href)
+    end
+  end
+
   test "Tiger: known links, fragments stripped, percent-encoding kept" do
     links = Links.extract(fixture("Tiger"), @base <> "Tiger") |> Map.new()
 

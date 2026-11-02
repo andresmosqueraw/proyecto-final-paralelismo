@@ -36,15 +36,32 @@ defmodule Player.Heuristic do
   def weights(:default), do: @default
   def weights(%{} = w), do: Map.merge(@default, w)
 
-  @doc "Lowercase word tokens of an article title (from a URL or canonical URL)."
+  # A plain list: a compiled pattern is a reference and cannot be a module attribute.
+  @separators ~w(_ \( \) , . - – — ' " : ; / ! ? & + ’) ++ [" "]
+
+  @doc """
+  Lowercase word tokens of the title of a **canonical** (already decoded) URL.
+  Plain binary splitting: this runs for every link of every page.
+  """
   @spec tokens(String.t()) :: [String.t()]
-  def tokens(url) do
-    url
-    |> Player.URL.title()
+  def tokens(canon) do
+    canon
+    |> last_segment()
     |> String.downcase()
-    |> String.split(~r/[^\p{L}\p{N}]+/u, trim: true)
-    |> Enum.reject(&(&1 in @stopwords or String.length(&1) < 2))
+    |> :binary.split(@separators, [:global, :trim_all])
+    |> Enum.reject(&(byte_size(&1) < 2 or &1 in @stopwords))
     |> Enum.uniq()
+  end
+
+  defp last_segment(path) do
+    case :binary.matches(path, "/") do
+      [] ->
+        path
+
+      ms ->
+        {pos, 1} = List.last(ms)
+        binary_part(path, pos + 1, byte_size(path) - pos - 1)
+    end
   end
 
   @doc "Share of the target's title tokens that also appear in `tokens`."
@@ -74,7 +91,7 @@ defmodule Player.Heuristic do
   """
   def score_links(links, child_depth, rel_p, in_target_out?, target_tokens, w) do
     base = w.rel * rel_p - w.depth * child_depth
-    text? = w.title != 0.0
+    prefilter = if w.title != 0.0, do: prefilter(target_tokens)
 
     links
     |> Enum.with_index()
@@ -82,10 +99,28 @@ defmodule Player.Heuristic do
       s =
         base +
           if(in_target_out?.(c), do: w.out, else: 0.0) +
-          if(text?, do: w.title * title_overlap(tokens(c), target_tokens), else: 0.0) +
+          title_score(prefilter, c, target_tokens, w.title) +
           if(i < @lead_links, do: w.lead, else: 0.0)
 
       {u, c, s}
     end)
+  end
+
+  # Tokenizing every link is the costly part, and almost no link shares a
+  # word with the target: a case-insensitive substring check skips those
+  # (a match only means "tokenize and check properly").
+  defp prefilter(%MapSet{map: m}) when map_size(m) == 0, do: nil
+
+  defp prefilter(target_tokens) do
+    alternatives = target_tokens |> Enum.map(&Regex.escape/1) |> Enum.join("|")
+    Regex.compile!(alternatives, "iu")
+  end
+
+  defp title_score(nil, _c, _target_tokens, _w), do: 0.0
+
+  defp title_score(re, c, target_tokens, w) do
+    if Regex.match?(re, last_segment(c)),
+      do: w * title_overlap(tokens(c), target_tokens),
+      else: 0.0
   end
 end

@@ -40,6 +40,48 @@ defmodule Player.URL do
   end
 
   @doc """
+  Like `resolve/2` for many hrefs of the same page, but fast.
+
+  For a bare article name without `/` (almost every Kiwix link),
+  `URI.merge(base, href)` is the base's directory followed by `href`, and its
+  canonical form is the canonical directory followed by `URI.decode(href)`.
+  The prefixes are computed once with `URI.merge/2` and `canonical/1`
+  themselves, so the result is the same string (a test checks it on every href
+  of real pages). Anything else falls back to `resolve/2`.
+  """
+  @spec resolver(String.t()) :: (String.t() -> {String.t(), String.t()} | nil)
+  def resolver(base) do
+    probe = base |> URI.merge("a") |> URI.to_string()
+    canon_probe = canonical(probe)
+
+    if String.ends_with?(probe, "/a") and String.ends_with?(canon_probe, "/a") do
+      url_prefix = binary_part(probe, 0, byte_size(probe) - 1)
+      canon_prefix = binary_part(canon_probe, 0, byte_size(canon_probe) - 1)
+
+      fn href ->
+        if article_href?(href) do
+          h = strip_fragment(href)
+
+          if h != "" and not String.contains?(h, "/") do
+            fast(url_prefix, canon_prefix, h)
+          else
+            resolve(base, href)
+          end
+        end
+      end
+    else
+      &resolve(base, &1)
+    end
+  end
+
+  defp fast(url_prefix, canon_prefix, h) do
+    {url_prefix <> h, String.trim_trailing(canon_prefix <> URI.decode(h), "/")}
+  rescue
+    # Malformed %-escape: the verifier's canonical/1 raises too.
+    ArgumentError -> nil
+  end
+
+  @doc """
   True for hrefs that point to another article in the same Kiwix book.
 
   Kiwix writes article links as bare relative names (`Bengal_tiger`,

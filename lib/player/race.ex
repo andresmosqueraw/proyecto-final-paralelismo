@@ -17,6 +17,8 @@ defmodule Player.Race do
       best score comes first (`Player.Heuristic`). Tasks insert; only the race takes.
     * `target_out` (`set`): canonical URLs linked from the target page.
     * `status` (`set`): `{:status, current_url, best_path, state}` for `status/1`.
+    * `measure` (`duplicate_bag`, only with `measure: true`): `{fetch_ms, process_ms, bytes}`
+      per fetched page, for the benchmark.
     * `trace` (`bag`, only with `trace: true`): `{canonical, score, depth, links_target?}`
       per fetched page, to validate the heuristic offline.
 
@@ -53,6 +55,15 @@ defmodule Player.Race do
   @no_path 1_000_000
   @max_attempts 2
   @target_wait_ms 3_000
+  # Fetches in flight. Kiwix, not our CPU, is the limit: on the local Kiwix
+  # throughput stays at ~350 pages/s from 16 to 128 in flight and only the
+  # latency per fetch grows, and the first path is a chain of ~3 sequential
+  # fetches. 16 had the best or near-best median alone and against a rival
+  # sharing Kiwix (fase5_hallazgos.md).
+  @concurrency 16
+  # ~6x the p99 fetch latency measured under contention (~350 ms), leaving room
+  # for a remote Kiwix. A timed-out fetch is retried once.
+  @receive_timeout 2_000
   # Safety net in case nobody kills us (benchmarks, tests). Races last 120 s.
   @lifetime_ms 150_000
 
@@ -81,9 +92,20 @@ defmodule Player.Race do
         decentralized_counters: false
       ])
 
+    bfs_share = Keyword.get(opts, :bfs_share, 0.0)
+
+    bfs_frontier =
+      if bfs_share > 0,
+        do: :ets.new(:bfs_frontier, [:ordered_set, :public, write_concurrency: true])
+
     target_out = :ets.new(:target_out, [:set, :public, read_concurrency: true])
     status = :ets.new(:status, [:set, :public, read_concurrency: true])
     trace = if opts[:trace], do: :ets.new(:trace, [:bag, :public, write_concurrency: true])
+
+    measure =
+      if opts[:measure],
+        do: :ets.new(:measure, [:duplicate_bag, :public, write_concurrency: true])
+
     # 1: pages fetched, 2: failed fetches
     counters = :counters.new(2, [:write_concurrency])
     atomics = :atomics.new(3, [])
@@ -97,6 +119,7 @@ defmodule Player.Race do
 
     :ets.insert(visited, {start_canon, nil, start_url, 0, start_key, :queued})
     :ets.insert(frontier, {start_key, start_url, start_canon, 0})
+    if bfs_frontier, do: :ets.insert(bfs_frontier, {{0, 0.0, 0}, start_url, start_canon, 0})
     :ets.insert(status, {:status, start_url, [], :running})
 
     :ok =
@@ -104,7 +127,8 @@ defmodule Player.Race do
         status: status,
         counters: counters,
         frontier: frontier,
-        trace: trace
+        trace: trace,
+        measure: measure
       })
 
     Process.send_after(self(), :lifetime_over, Keyword.get(opts, :lifetime_ms, @lifetime_ms))
@@ -117,14 +141,17 @@ defmodule Player.Race do
       frontier: frontier,
       target_out: target_out,
       trace: trace,
+      measure: measure,
+      bfs_frontier: bfs_frontier,
+      bfs_share: bfs_share,
       counters: counters,
       atomics: atomics,
       target_canon: target_canon,
-      target_tokens: MapSet.new(Heuristic.tokens(target_url)),
+      target_tokens: MapSet.new(Heuristic.tokens(target_canon)),
       weights: weights,
       # BFS (depth-only) needs neither the target's links nor the wait.
       needs_target?: weights.out != 0.0 or weights.rel != 0.0,
-      receive_timeout: Keyword.get(opts, :receive_timeout, 5_000)
+      receive_timeout: Keyword.get(opts, :receive_timeout, @receive_timeout)
     }
 
     state = %{
@@ -133,7 +160,7 @@ defmodule Player.Race do
       status: status,
       start_url: start_url,
       target_url: target_url,
-      concurrency: Keyword.get(opts, :concurrency, 4 * System.schedulers_online()),
+      concurrency: Keyword.get(opts, :concurrency, @concurrency),
       inflight: %{},
       # The path we reported last and when (ms since start); the harness keeps
       # it with that arrival time.
@@ -173,6 +200,9 @@ defmodule Player.Race do
     state =
       case result do
         :ok -> state
+        # The page answered (404, 500...): asking again will not help.
+        {:error, {:http, _status}} -> state
+        # Transport errors and timeouts: one retry.
         _error -> retry(state, job)
       end
 
@@ -196,32 +226,67 @@ defmodule Player.Race do
     if map_size(state.inflight) >= state.concurrency do
       state
     else
-      %{frontier: frontier, visited: visited, atomics: atomics} = state.ctx
+      %{visited: visited, atomics: atomics} = state.ctx
 
-      case :ets.first(frontier) do
-        :"$end_of_table" ->
+      case take_next(state.ctx) do
+        :empty ->
           maybe_finish(state)
 
-        key ->
-          case :ets.take(frontier, key) do
-            [{^key, url, canon, depth}] ->
-              cond do
-                depth + 2 >= :atomics.get(atomics, @a_best) ->
-                  dispatch(state)
-
-                # Already fetched (a stale duplicate left by a priority update).
-                :ets.lookup_element(visited, canon, 6, :taken) == :taken ->
-                  dispatch(state)
-
-                true ->
-                  :ets.update_element(visited, canon, {6, :taken})
-                  state |> spawn_fetch({:page, url, canon, depth, -elem(key, 0), 1}) |> dispatch()
-              end
-
-            [] ->
+        {url, canon, depth, score} ->
+          cond do
+            depth + 2 >= :atomics.get(atomics, @a_best) ->
               dispatch(state)
+
+            # Already fetched (a stale duplicate left by a priority update or
+            # by the other frontier of the portfolio).
+            :ets.lookup_element(visited, canon, 6, :taken) == :taken ->
+              dispatch(state)
+
+            true ->
+              :ets.update_element(visited, canon, {6, :taken})
+              state |> spawn_fetch({:page, url, canon, depth, score, 1}) |> dispatch()
           end
+
+        :retry ->
+          dispatch(state)
       end
+    end
+  end
+
+  # Portfolio (Gomes & Selman 01): with probability `bfs_share` take the
+  # shallowest entry (ties by score) instead of the best-scored one. Every
+  # queued node is in the main frontier, so it alone decides emptiness.
+  defp take_next(%{bfs_frontier: bfs} = ctx) when bfs != nil do
+    if :rand.uniform() < ctx.bfs_share do
+      case take_first(bfs) do
+        {:ok, {_d, neg, _seq}, url, canon, depth} -> {url, canon, depth, -neg}
+        :empty -> take_main(ctx)
+        :retry -> :retry
+      end
+    else
+      take_main(ctx)
+    end
+  end
+
+  defp take_next(ctx), do: take_main(ctx)
+
+  defp take_main(ctx) do
+    case take_first(ctx.frontier) do
+      {:ok, {neg, _seq}, url, canon, depth} -> {url, canon, depth, -neg}
+      other -> other
+    end
+  end
+
+  defp take_first(table) do
+    case :ets.first(table) do
+      :"$end_of_table" ->
+        :empty
+
+      key ->
+        case :ets.take(table, key) do
+          [{^key, url, canon, depth}] -> {:ok, key, url, canon, depth}
+          [] -> :retry
+        end
     end
   end
 
@@ -281,8 +346,11 @@ defmodule Player.Race do
 
   @doc false
   def crawl(ctx, url, canon, depth, score) do
+    t0 = System.monotonic_time(:microsecond)
+
     case Fetcher.get(url, receive_timeout: ctx.receive_timeout) do
       {:ok, body} ->
+        t1 = System.monotonic_time(:microsecond)
         :counters.add(ctx.counters, 1, 1)
         links = Links.extract(body, url)
         target = ctx.target_canon
@@ -295,6 +363,11 @@ defmodule Player.Race do
 
         if child_depth + 2 < :atomics.get(ctx.atomics, @a_best) do
           expand(ctx, canon, child_depth, links)
+        end
+
+        if ctx.measure do
+          t2 = System.monotonic_time(:microsecond)
+          :ets.insert(ctx.measure, {(t1 - t0) / 1000, (t2 - t1) / 1000, byte_size(body)})
         end
 
         :ok
@@ -350,7 +423,11 @@ defmodule Player.Race do
       end)
 
     :ets.insert(frontier, entries)
+    if ctx.bfs_frontier, do: :ets.insert(ctx.bfs_frontier, Enum.map(entries, &by_depth/1))
   end
+
+  # Main-frontier entry -> BFS-frontier entry ({depth, -score, seq} key).
+  defp by_depth({{neg, seq}, u, c, d}), do: {{d, neg, seq}, u, c, d}
 
   # A link already queued from another page: move it up if it now scores
   # higher. If the new page is at least as shallow as the old parent, it
@@ -402,9 +479,9 @@ defmodule Player.Race do
       # Search only for paths shorter than the best one known, reported or not.
       :atomics.put(state.ctx.atomics, @a_best, len)
       # Entries at depth >= len - 2 cannot lead to a shorter path.
-      :ets.select_delete(state.ctx.frontier, [
-        {{:_, :_, :_, :"$1"}, [{:>=, :"$1", len - 2}], [true]}
-      ])
+      for t <- [state.ctx.frontier, state.ctx.bfs_frontier], t != nil do
+        :ets.select_delete(t, [{{:_, :_, :_, :"$1"}, [{:>=, :"$1", len - 2}], [true]}])
+      end
 
       if report?(state, len, now) do
         WikiRace.Harness.report(path)
