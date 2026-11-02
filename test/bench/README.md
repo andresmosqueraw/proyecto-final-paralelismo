@@ -31,6 +31,8 @@ docker run --rm --network host -v "$PWD":/app -v player_deps:/app/deps -v player
 | `--filter TXT` / `--per-level N` / `--limit N` | Elegir casos. `--per-level` toma los N primeros de cada nivel, que son los más jugados por humanos. |
 | `--out F.tsv` | Una fila por caso. El resumen por nivel se escribe en `F.md`. |
 | `--concurrency N` | Se pasa a `Player.Crawler.start/3`. |
+| `--weights W` | Pesos de `Player.Heuristic`: `default`, `bfs` (reproduce la línea base) o `out=2,title=1.5,rel=2,lead=0,depth=1`. |
+| `--trace F.tsv` | Escribe, por cada página descargada, la profundidad, el score y si enlaza al destino. Sirve de entrada a `validate.exs`. |
 
 ## Columnas del TSV
 
@@ -59,3 +61,11 @@ Compara solo los casos que están en los dos archivos. Por nivel muestra:
 - mediana de `t_first` y su cambio;
 - mediana por caso de `t_first nuevo / base`;
 - `hops_ratio` y utilización.
+
+## Validar la heurística (Wilt & Ruml)
+
+```sh
+mix run --no-start test/bench/validate.exs /out/TRACE.tsv
+```
+
+Calcula por caso el ρ de Spearman entre el score y −d\*, donde d\* = 1 si la página enlaza al destino y d\* ≥ 2 si no. Lo da también normalizado por el máximo posible, √(3p(1−p)), y calcula además el AUC.

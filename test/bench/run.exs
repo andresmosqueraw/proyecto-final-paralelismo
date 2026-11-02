@@ -10,6 +10,8 @@
 #   --limit N          keep at most N cases
 #   --out FILE.tsv     per-case results (default bench_results.tsv); FILE.md gets the summary
 #   --concurrency N    passed to Player.Crawler.start/3
+#   --weights W        heuristic weights: "bfs", "default" or "out=2,title=1.5,rel=2,lead=0.3,depth=1"
+#   --trace FILE.tsv   also write, per fetched page: case, depth, score, links_target
 #   --label TEXT       title of the summary
 #
 # CASES.exs evaluates to a list of %{start: title, target: title, note: text}
@@ -35,6 +37,8 @@ defmodule Bench do
           time: :integer,
           out: :string,
           concurrency: :integer,
+          weights: :string,
+          trace: :string,
           label: :string
         ]
       )
@@ -42,7 +46,14 @@ defmodule Bench do
     kiwix = Keyword.get(opts, :kiwix, "http://localhost:8081/content/wikipedia_en_all_nopic/")
     time_s = Keyword.get(opts, :time, 120)
     out = Keyword.get(opts, :out, "bench_results.tsv")
-    crawler_opts = Keyword.take(opts, [:concurrency])
+    trace_file = Keyword.get(opts, :trace)
+
+    crawler_opts =
+      Keyword.take(opts, [:concurrency]) ++
+        [weights: parse_weights(Keyword.get(opts, :weights, "default")), trace: trace_file != nil]
+
+    if trace_file,
+      do: File.write!(trace_file, "level\tstart\ttarget\tdepth\tscore\tlinks_target\n")
 
     cases =
       cases_file
@@ -61,7 +72,7 @@ defmodule Bench do
 
     rows =
       for {c, i} <- Enum.with_index(cases, 1) do
-        row = run_case(c, kiwix, time_s * 1_000, crawler_opts)
+        row = run_case(c, kiwix, time_s * 1_000, crawler_opts, trace_file)
         File.write!(out, BenchStats.to_line(row) <> "\n", [:append])
 
         IO.puts(
@@ -114,7 +125,34 @@ defmodule Bench do
 
   defp slug(kiwix, title), do: kiwix <> (title |> String.replace(" ", "_") |> URI.encode())
 
-  defp run_case(c, kiwix, limit_ms, crawler_opts) do
+  defp parse_weights("bfs"), do: :bfs
+  defp parse_weights("default"), do: :default
+
+  defp parse_weights(spec) do
+    for kv <- String.split(spec, ","), into: %{} do
+      [k, v] = String.split(kv, "=")
+      {String.to_atom(k), elem(Float.parse(v), 0)}
+    end
+  end
+
+  defp write_trace(nil, _c, _pid), do: :ok
+
+  defp write_trace(file, c, pid) do
+    case Player.Registry.lookup(pid) do
+      %{trace: trace} when trace != nil ->
+        lines =
+          for {_canon, score, depth, hit} <- :ets.tab2list(trace), depth > 0 do
+            "#{c.level}\t#{c.start}\t#{c.target}\t#{depth}\t#{Float.round(score * 1.0, 4)}\t#{hit}\n"
+          end
+
+        File.write!(file, lines, [:append])
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp run_case(c, kiwix, limit_ms, crawler_opts, trace_file) do
     start = slug(kiwix, c.start)
     target = slug(kiwix, c.target)
     flush()
@@ -131,6 +169,7 @@ defmodule Bench do
         nil -> 0
       end
 
+    write_trace(trace_file, c, pid)
     Process.exit(pid, :kill)
 
     receive do

@@ -22,9 +22,13 @@ defmodule Player.Path do
   defp walk(_visited, _canon, _acc, n) when n > 1_000, do: []
 
   defp walk(visited, canon, acc, n) do
+    # Rows start with {canonical, parent_canonical, url, ...}; the rest varies.
     case :ets.lookup(visited, canon) do
-      [{^canon, parent, url, _depth}] -> walk(visited, parent, [url | acc], n + 1)
-      [] -> []
+      [row] when elem(row, 0) == canon ->
+        walk(visited, elem(row, 1), [elem(row, 2) | acc], n + 1)
+
+      [] ->
+        []
     end
   end
 

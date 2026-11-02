@@ -10,35 +10,51 @@ defmodule Player.Race do
 
   ## Shared state (ETS)
 
-    * `visited` (`set`): `{canonical, parent_canonical, url, depth}`. A URL is
-      inserted with `:ets.insert_new/2` the first time any page links to it, so
-      each article enters the frontier once, with the page that linked to it.
-    * `frontier` (`ordered_set`): `{{depth, seq}, url, canonical}`. Ordering by
-      depth gives BFS. Tasks insert children directly; only the race takes.
+    * `visited` (`set`): `{canonical, parent_canonical, url, depth, key, :queued | :taken}`.
+      A URL is inserted with `:ets.insert_new/2` the first time a page links to
+      it. `url` is the href as written in the parent page (what we report).
+    * `frontier` (`ordered_set`): `{{-score, seq}, url, canonical, depth}`. The
+      best score comes first (`Player.Heuristic`). Tasks insert; only the race takes.
+    * `target_out` (`set`): canonical URLs linked from the target page.
     * `status` (`set`): `{:status, current_url, best_path, state}` for `status/1`.
+    * `trace` (`bag`, only with `trace: true`): `{canonical, score, depth, links_target?}`
+      per fetched page, to validate the heuristic offline.
 
   ## Search
 
-  The race keeps up to `concurrency` fetches in flight. A task downloads a page,
-  extracts its article links and **checks for the target before inserting
-  anything**, so a path is found as soon as a page that links to the target is
-  read, without downloading the target itself.
+  At start the race fetches the start page and, in parallel, the target page
+  (its links feed the heuristic; the start page waits for them, at most 3 s).
+
+  A task downloads a page, extracts its article links and **checks for the
+  target before anything else**, so a path is reported as soon as a page that
+  links to the target is read. Then it scores the links and inserts the new
+  ones. A link already queued from another page is moved up if it now scores
+  higher (with a compare-and-swap on its `visited` row), and its parent becomes
+  the new page. Every parent in `visited` is a page whose links contained the
+  child, so any reconstructed path is a real chain of links.
 
   After a path of `L` URLs is found, pages at depth `d` are only useful if
-  `d + 2 < L`, so deeper work is pruned and the search keeps looking for a
-  shorter path until the frontier empties.
+  `d + 2 < L`: deeper frontier entries are deleted and no deeper links are
+  queued, and the search keeps looking for a shorter path until the frontier
+  empties.
   """
 
   use GenServer, restart: :temporary
 
   require Logger
 
-  alias Player.{Fetcher, Links, Path, URL}
+  alias Player.{Fetcher, Heuristic, Links, Path, URL}
 
   @no_path 1_000_000
   @max_attempts 2
+  @target_wait_ms 3_000
   # Safety net in case nobody kills us (benchmarks, tests). Races last 120 s.
   @lifetime_ms 150_000
+
+  # :atomics slots
+  @a_best 1
+  @a_target_ready 2
+  @a_target_n 3
 
   def start_link({start_url, target_url, opts}) do
     GenServer.start_link(__MODULE__, {start_url, target_url, opts})
@@ -60,32 +76,49 @@ defmodule Player.Race do
         decentralized_counters: false
       ])
 
+    target_out = :ets.new(:target_out, [:set, :public, read_concurrency: true])
     status = :ets.new(:status, [:set, :public, read_concurrency: true])
+    trace = if opts[:trace], do: :ets.new(:trace, [:bag, :public, write_concurrency: true])
     # 1: pages fetched, 2: failed fetches
     counters = :counters.new(2, [:write_concurrency])
-    # 1: length (in URLs) of the best path reported so far
-    best = :atomics.new(1, [])
-    :atomics.put(best, 1, @no_path)
+    atomics = :atomics.new(3, [])
+    :atomics.put(atomics, @a_best, @no_path)
 
     {:ok, tasks} = Task.Supervisor.start_link()
 
     start_canon = URL.canonical(start_url)
     target_canon = URL.canonical(target_url)
+    start_key = {0.0, 0}
 
-    :ets.insert(visited, {start_canon, nil, start_url, 0})
-    :ets.insert(frontier, {{0, 0}, start_url, start_canon})
+    :ets.insert(visited, {start_canon, nil, start_url, 0, start_key, :queued})
+    :ets.insert(frontier, {start_key, start_url, start_canon, 0})
     :ets.insert(status, {:status, start_url, [], :running})
 
-    :ok = Player.Registry.register(%{status: status, counters: counters, frontier: frontier})
+    :ok =
+      Player.Registry.register(%{
+        status: status,
+        counters: counters,
+        frontier: frontier,
+        trace: trace
+      })
+
     Process.send_after(self(), :lifetime_over, Keyword.get(opts, :lifetime_ms, @lifetime_ms))
+
+    weights = Heuristic.weights(Keyword.get(opts, :weights, :default))
 
     ctx = %{
       race: self(),
       visited: visited,
       frontier: frontier,
+      target_out: target_out,
+      trace: trace,
       counters: counters,
-      best: best,
+      atomics: atomics,
       target_canon: target_canon,
+      target_tokens: MapSet.new(Heuristic.tokens(target_url)),
+      weights: weights,
+      # BFS (depth-only) needs neither the target's links nor the wait.
+      needs_target?: weights.out != 0.0 or weights.rel != 0.0,
       receive_timeout: Keyword.get(opts, :receive_timeout, 5_000)
     }
 
@@ -102,11 +135,17 @@ defmodule Player.Race do
       started_at: System.monotonic_time(:millisecond)
     }
 
-    if start_canon == target_canon do
-      # No valid path exists (it would repeat the same article).
-      {:ok, finish(state)}
-    else
-      {:ok, state, {:continue, :dispatch}}
+    cond do
+      start_canon == target_canon ->
+        # No valid path exists (it would repeat the same article).
+        {:ok, finish(state)}
+
+      ctx.needs_target? ->
+        {:ok, spawn_target_fetch(state, 1), {:continue, :dispatch}}
+
+      true ->
+        :atomics.put(atomics, @a_target_ready, 1)
+        {:ok, state, {:continue, :dispatch}}
     end
   end
 
@@ -148,62 +187,105 @@ defmodule Player.Race do
     if map_size(state.inflight) >= state.concurrency do
       state
     else
-      case :ets.first(state.ctx.frontier) do
+      %{frontier: frontier, visited: visited, atomics: atomics} = state.ctx
+
+      case :ets.first(frontier) do
         :"$end_of_table" ->
           maybe_finish(state)
 
-        {depth, _seq} = key ->
-          if depth + 2 >= :atomics.get(state.ctx.best, 1) do
-            # Ordered by depth: everything left is at least as deep.
-            :ets.delete_all_objects(state.ctx.frontier)
-            maybe_finish(state)
-          else
-            case :ets.take(state.ctx.frontier, key) do
-              [{^key, url, canon}] -> state |> spawn_fetch({url, canon, depth, 1}) |> dispatch()
-              [] -> dispatch(state)
-            end
+        key ->
+          case :ets.take(frontier, key) do
+            [{^key, url, canon, depth}] ->
+              cond do
+                depth + 2 >= :atomics.get(atomics, @a_best) ->
+                  dispatch(state)
+
+                # Already fetched (a stale duplicate left by a priority update).
+                :ets.lookup_element(visited, canon, 6, :taken) == :taken ->
+                  dispatch(state)
+
+                true ->
+                  :ets.update_element(visited, canon, {6, :taken})
+                  state |> spawn_fetch({:page, url, canon, depth, -elem(key, 0), 1}) |> dispatch()
+              end
+
+            [] ->
+              dispatch(state)
           end
       end
     end
   end
 
-  defp spawn_fetch(state, {url, canon, depth, _attempt} = job) do
+  defp spawn_fetch(state, {:page, url, canon, depth, score, _attempt} = job) do
     ctx = state.ctx
-    task = Task.Supervisor.async_nolink(state.tasks, fn -> crawl(ctx, url, canon, depth) end)
+
+    task =
+      Task.Supervisor.async_nolink(state.tasks, fn -> crawl(ctx, url, canon, depth, score) end)
+
     :ets.update_element(state.status, :status, {2, url})
     %{state | inflight: Map.put(state.inflight, task.ref, job)}
   end
 
-  defp retry(state, {url, canon, depth, attempt}) when attempt < @max_attempts do
-    spawn_fetch(state, {url, canon, depth, attempt + 1})
+  defp spawn_target_fetch(state, attempt) do
+    ctx = state.ctx
+    url = state.target_url
+    task = Task.Supervisor.async_nolink(state.tasks, fn -> load_target(ctx, url) end)
+    %{state | inflight: Map.put(state.inflight, task.ref, {:target, attempt})}
+  end
+
+  defp retry(state, {:page, url, canon, depth, score, attempt}) when attempt < @max_attempts do
+    spawn_fetch(state, {:page, url, canon, depth, score, attempt + 1})
+  end
+
+  defp retry(state, {:target, attempt}) when attempt < @max_attempts do
+    spawn_target_fetch(state, attempt + 1)
+  end
+
+  defp retry(state, {:target, _attempt}) do
+    # Go on without the target's links rather than wait forever.
+    :atomics.put(state.ctx.atomics, @a_target_ready, 1)
+    state
   end
 
   defp retry(state, _job), do: state
 
-  ## Work done inside each task
+  ## Work done inside tasks
 
   @doc false
-  def crawl(ctx, url, canon, depth) do
+  def load_target(ctx, url) do
+    case Fetcher.get(url, receive_timeout: ctx.receive_timeout) do
+      {:ok, body} ->
+        :counters.add(ctx.counters, 1, 1)
+        links = Links.extract(body, url)
+        :ets.insert(ctx.target_out, Enum.map(links, fn {_u, c} -> {c} end))
+        :atomics.put(ctx.atomics, @a_target_n, length(links))
+        :atomics.put(ctx.atomics, @a_target_ready, 1)
+        :ok
+
+      {:error, reason} ->
+        :counters.add(ctx.counters, 2, 1)
+        {:error, reason}
+    end
+  rescue
+    ArgumentError -> :race_gone
+  end
+
+  @doc false
+  def crawl(ctx, url, canon, depth, score) do
     case Fetcher.get(url, receive_timeout: ctx.receive_timeout) do
       {:ok, body} ->
         :counters.add(ctx.counters, 1, 1)
         links = Links.extract(body, url)
         target = ctx.target_canon
+        links_target? = Enum.any?(links, fn {_u, c} -> c == target end)
 
-        if Enum.any?(links, fn {_u, c} -> c == target end) do
-          send(ctx.race, {:found, canon})
-        end
+        if links_target?, do: send(ctx.race, {:found, canon})
+        if ctx.trace, do: :ets.insert(ctx.trace, {canon, score, depth, links_target?})
 
         child_depth = depth + 1
 
-        if child_depth + 2 < :atomics.get(ctx.best, 1) do
-          new =
-            for {u, c} <- links,
-                c != target,
-                :ets.insert_new(ctx.visited, {c, canon, u, child_depth}),
-                do: {{child_depth, :erlang.unique_integer([:monotonic, :positive])}, u, c}
-
-          :ets.insert(ctx.frontier, new)
+        if child_depth + 2 < :atomics.get(ctx.atomics, @a_best) do
+          expand(ctx, canon, child_depth, links)
         end
 
         :ok
@@ -218,20 +300,88 @@ defmodule Player.Race do
     ArgumentError -> :race_gone
   end
 
+  defp expand(ctx, parent, child_depth, links) do
+    %{visited: visited, frontier: frontier, target_out: target_out} = ctx
+    if ctx.needs_target?, do: wait_for_target(ctx.atomics, @target_wait_ms)
+
+    target_n = :atomics.get(ctx.atomics, @a_target_n)
+    in_target_out? = fn c -> target_n > 0 and :ets.member(target_out, c) end
+
+    rel_p =
+      if ctx.weights.rel != 0.0 and target_n > 0 do
+        shared = Enum.count(links, fn {_u, c} -> :ets.member(target_out, c) end)
+        Heuristic.rel(shared, length(links), target_n)
+      else
+        0.0
+      end
+
+    target = ctx.target_canon
+
+    entries =
+      links
+      |> Heuristic.score_links(child_depth, rel_p, in_target_out?, ctx.target_tokens, ctx.weights)
+      |> Enum.reduce([], fn
+        {_u, ^target, _s}, acc ->
+          acc
+
+        {u, c, s}, acc ->
+          key = {-s, :erlang.unique_integer([:monotonic, :positive])}
+          row = {c, parent, u, child_depth, key, :queued}
+
+          if :ets.insert_new(visited, row) do
+            [{key, u, c, child_depth} | acc]
+          else
+            maybe_promote(visited, frontier, c, s, row, key, u, child_depth, acc)
+          end
+      end)
+
+    :ets.insert(frontier, entries)
+  end
+
+  # A link already queued from another page: move it up if it now scores
+  # higher. The compare-and-swap fails if the row changed in the meantime
+  # (taken by the race, or promoted by another task), and then we do nothing.
+  defp maybe_promote(visited, frontier, c, s, row, key, u, child_depth, acc) do
+    case :ets.lookup(visited, c) do
+      [{^c, _p, _u, _d, {old_neg, _} = old_key, :queued} = old] when s > -old_neg ->
+        if :ets.select_replace(visited, [{old, [], [{:const, row}]}]) == 1 do
+          :ets.delete(frontier, old_key)
+          [{key, u, c, child_depth} | acc]
+        else
+          acc
+        end
+
+      _ ->
+        acc
+    end
+  end
+
+  defp wait_for_target(atomics, left) do
+    if :atomics.get(atomics, @a_target_ready) == 0 and left > 0 do
+      Process.sleep(5)
+      wait_for_target(atomics, left - 5)
+    end
+  end
+
   ## Results
 
   defp found(state, parent_canon) do
     path = Path.to_target(state.ctx.visited, parent_canon, state.start_url, state.target_url)
-    best = :atomics.get(state.ctx.best, 1)
+    best = :atomics.get(state.ctx.atomics, @a_best)
 
     if path != [] and length(path) < best and
          Path.valid_shape?(path, state.start_url, state.target_url) do
       WikiRace.Harness.report(path)
-      :atomics.put(state.ctx.best, 1, length(path))
+      len = length(path)
+      :atomics.put(state.ctx.atomics, @a_best, len)
       :ets.update_element(state.status, :status, [{3, path}, {4, :found}])
+      # Entries at depth >= len - 2 cannot lead to a shorter path.
+      :ets.select_delete(state.ctx.frontier, [
+        {{:_, :_, :_, :"$1"}, [{:>=, :"$1", len - 2}], [true]}
+      ])
 
       Logger.info(
-        "[race] path of #{length(path)} articles after " <>
+        "[race] path of #{len} articles after " <>
           "#{System.monotonic_time(:millisecond) - state.started_at} ms: " <>
           Enum.map_join(path, " -> ", &URL.title/1)
       )
